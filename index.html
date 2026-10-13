@@ -32,6 +32,10 @@
   .timer.low .fill { background: var(--danger); }
   .timer.low .num { color: var(--danger); }
   .timer.waiting .num { color: var(--sub); font-weight: 400; font-size: .9rem; }
+  .prep { margin-top: 18px; font-size: .92rem; color: var(--sub); }
+  .prep .track { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin: 6px 0; }
+  .prep .track i { display: block; height: 100%; background: var(--accent); width: 0; }
+  .prep.ng { color: var(--danger); }
   .toast { background: #fdf3df; border: 1px solid #ecd29a; color: #7a5208; border-radius: 8px;
     padding: 8px 14px; margin-bottom: 12px; font-size: .92rem; }
   .qtitle { font-size: 1.12rem; font-weight: 700; margin: 0 0 8px; }
@@ -76,11 +80,11 @@ const app = document.getElementById('app');
 let S = null;               // アンケート
 let idx = -1;               // 表示中の質問
 const answers = {};         // qid -> {value, timeMs, timedOut}
-const images = {};          // 画像ID -> dataURL | 'error'
+const loaded = {};          // 画像ファイル名 -> 読み込み・展開済みの <img>
 const respondentId = 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 let startedAt = null, t0 = 0, shownAt = null, timerId = null, deadline = 0, finished = false;
-let begunFor = -1, imgWait = null;
-const IMAGE_WAIT_MS = 20000; // 画像がこの時間内に表示できなければ、画像なしで時間を計り始める
+let begunFor = -1;
+const IMAGE_DIR = 'images/';   // GitHub の images フォルダ
 
 // Apps Script（config.js の API_URL）にデータを送受信する
 async function run(fn) {
@@ -89,8 +93,10 @@ async function run(fn) {
     throw new Error('config.js に Apps Script のウェブアプリURL（末尾が /exec）が設定されていません。');
   }
   let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt) await new Promise(r => setTimeout(r, 800 * attempt + Math.random() * 700));
+  // 混雑時は少しずつ間隔をあけて最大6回までやり直す（合計で約30秒）
+  const waits = [0, 1000, 2500, 4500, 7000, 10000];
+  for (let attempt = 0; attempt < waits.length; attempt++) {
+    if (attempt) await new Promise(r => setTimeout(r, waits[attempt] + Math.random() * 1500));
     let j;
     try {
       // text/plain で送ると、Googleのログイン状態に関係なく通信できる
@@ -100,7 +106,10 @@ async function run(fn) {
       lastErr = new Error('Apps Script に接続できませんでした。デプロイの「アクセスできるユーザー」が「全員」になっているか確認してください。');
       continue; // 混雑などの一時的な失敗は自動でやり直す
     }
-    if (!j.ok) throw new Error(j.error || 'エラーが発生しました');
+    if (!j.ok) {
+      if (/simultaneous|too many|invoked|同時|ロック|lock/i.test(j.error || '')) { lastErr = new Error('混み合っています。少し待ってからもう一度お試しください。'); continue; }
+      throw new Error(j.error || 'エラーが発生しました');
+    }
     return j.data;
   }
   throw lastErr;
@@ -117,20 +126,39 @@ run('getPublicSurvey').then(sv => {
     return;
   }
   renderIntro();
-  preloadImages();
 }).catch(e => { app.innerHTML = `<div class="card">読み込めませんでした：${esc(e.message)}</div>`; });
 
-// 画像は質問順に1枚ずつ先読み
-async function preloadImages() {
-  for (const q of S.questions) {
-    for (const id of q.imageIds || []) {
-      if (images[id]) continue;
-      try { images[id] = await run('getImage', id); }
-      catch (e) { images[id] = 'error'; }
-      const cur = S.questions[idx];
-      if (cur && (cur.imageIds || []).includes(id)) showImages(cur);
-    }
+function imgUrl(name) { return IMAGE_DIR + encodeURIComponent(name); }
+
+// 1枚読み込んで、表示できる状態（展開済み）まで準備する。失敗したら3回までやり直す
+async function loadOne(name) {
+  for (let t = 0; t < 3; t++) {
+    try {
+      const img = new Image();
+      img.src = imgUrl(name);
+      await img.decode();
+      return img;
+    } catch (e) { await new Promise(r => setTimeout(r, 1000 * (t + 1))); }
   }
+  throw new Error(name);
+}
+
+// 回答を始める前に、すべての画像を読み込んでおく（回答中の読み込み待ちをなくす）
+async function preloadAll(onProgress) {
+  const names = [...new Set(S.questions.flatMap(q => q.images || []))].filter(n => !loaded[n]);
+  const total = Object.keys(loaded).length + names.length;
+  const failed = [];
+  let i = 0;
+  const worker = async () => {
+    while (i < names.length) {
+      const n = names[i++];
+      try { loaded[n] = await loadOne(n); } catch (e) { failed.push(n); }
+      onProgress(Object.keys(loaded).length, total);
+    }
+  };
+  onProgress(Object.keys(loaded).length, total);
+  await Promise.all([worker(), worker(), worker(), worker()]); // 4枚ずつ並行
+  return failed;
 }
 
 function renderIntro() {
@@ -139,12 +167,31 @@ function renderIntro() {
     <h1>${esc(S.title)}</h1>
     <div class="desc">${rich(S.description)}</div>
     ${timed ? `<div class="note">全${S.questions.length}問のうち${timed}問に回答の制限時間があります。画面上部の残り時間をご確認ください。</div>` : ''}
-    <div class="nav"><button class="primary" id="start">回答を始める</button></div></div>`;
-  document.getElementById('start').onclick = () => {
+    <div class="prep" id="prep" role="status"></div>
+    <div class="nav"><button class="primary" id="start" disabled>画像を準備しています…</button></div></div>`;
+  const btn = document.getElementById('start'), prep = document.getElementById('prep');
+  const load = async () => {
+    btn.disabled = true; btn.textContent = '画像を準備しています…'; prep.className = 'prep';
+    const failed = await preloadAll((done, total) => {
+      if (!total) return;
+      prep.innerHTML = `画像を準備しています（${done} / ${total}）<div class="track"><i style="width:${done / total * 100}%"></i></div>`;
+    });
+    if (failed.length) {
+      prep.className = 'prep ng';
+      prep.innerHTML = `${failed.length}枚の画像を読み込めませんでした。通信の良い場所で「もう一度読み込む」を押してください。`;
+      btn.disabled = false; btn.textContent = 'もう一度読み込む'; btn.onclick = load;
+      console.warn('読み込めなかった画像:', failed);
+      return;
+    }
+    prep.textContent = '';
+    btn.disabled = false; btn.textContent = '回答を始める'; btn.onclick = start;
+  };
+  const start = () => {
     startedAt = new Date().toISOString(); t0 = performance.now();
     window.addEventListener('beforeunload', warnLeave);
     go(0);
   };
+  load();
 }
 function warnLeave(e) { if (!finished) { e.preventDefault(); e.returnValue = ''; } }
 
@@ -155,7 +202,6 @@ function canGoBack(i) {
 
 function go(i, afterTimeout) {
   stopTimer();
-  clearTimeout(imgWait);
   begunFor = -1;
   idx = i;
   const q = S.questions[i], n = S.questions.length;
@@ -173,16 +219,16 @@ function go(i, afterTimeout) {
       <span class="other">その他：<input type="text" id="otherTxt" value="${esc(otherPrev ? otherPrev.replace(/^その他:?\s?/, '') : '')}"></span></label>` : '') + '</div>';
   }
   const last = i === n - 1;
-  const ids = q.imageIds || [];
+  const ids = q.images || [];
   app.innerHTML = `
     ${afterTimeout ? '<div class="toast" role="status">前の質問は制限時間を過ぎたため、次の質問に進みました。</div>' : ''}
     <div class="progress"><span>${i + 1} / ${n}</span><div class="bar"><i style="width:${(i / n) * 100}%"></i></div></div>
-    ${q.timeLimit ? `<div class="timer waiting" id="timer"><div class="row"><span>残り時間</span><span class="num" id="tnum">画像の読み込み待ち</span></div><div class="track"><div class="fill" id="tfill"></div></div></div>` : ''}
+    ${q.timeLimit ? `<div class="timer waiting" id="timer"><div class="row"><span>残り時間</span><span class="num" id="tnum">準備中</span></div><div class="track"><div class="fill" id="tfill"></div></div></div>` : ''}
     <div class="card">
       <p class="qtitle">${rich(q.title)}${q.required ? '<span class="req" aria-label="必須">*</span>' : ''}</p>
       ${q.description ? `<div class="qdesc">${rich(q.description)}</div>` : ''}
       ${ids.length ? `<div class="imgs n${ids.length}">${ids.map((_, k) =>
-        `<div class="imgbox" data-k="${k}">画像を読み込み中…</div>`).join('')}</div>` : ''}
+        `<div class="imgbox" data-k="${k}"></div>`).join('')}</div>` : ''}
       ${body}
       <div class="err" id="err" role="alert"></div>
       <div class="nav">
@@ -196,54 +242,34 @@ function go(i, afterTimeout) {
   const b = document.getElementById('back');
   if (b) b.onclick = () => { record(q, collect(q), false); go(i - 1); };
   window.scrollTo(0, 0);
-  if (ids.length) {
-    showImages(q);
-    // 画像の読み込みが止まっても、制限時間が始まらないままにならないようにする
-    imgWait = setTimeout(() => {
-      if (idx !== i || begunFor === i) return;
-      document.querySelectorAll('.imgbox').forEach(box => {
-        if (box.dataset.state !== 'ok') { box.dataset.state = 'fail'; box.textContent = '画像を表示できませんでした'; }
-      });
-      begin(q);
-    }, IMAGE_WAIT_MS);
-  } else begin(q);
+  if (ids.length) showImages(q); else begin(q);
 }
 
-// すべての画像が表示（または失敗）し終えたら時間を計り始める
+// 画像は回答開始前に読み込み済みなので、すぐに表示して時間を計り始める
 function showImages(q) {
-  const ids = q.imageIds || [];
+  const ids = q.images || [];
   const boxes = Array.from(document.querySelectorAll('.imgbox'));
-  const checkAll = () => { if (boxes.every(b => b.dataset.state === 'ok' || b.dataset.state === 'fail')) begin(q); };
   boxes.forEach((box, k) => {
-    const d = images[ids[k]];
-    if (!d || box.dataset.state) return;
-    box.dataset.state = 'loading';
-    const fail = () => { box.dataset.state = 'fail'; box.textContent = '画像を表示できませんでした'; checkAll(); };
-    if (d === 'error') return fail();
-    const img = new Image();
+    const img = loaded[ids[k]].cloneNode();
     img.alt = ids.length > 1 ? `画像${k + 1}` : '設問の画像';
-    img.onload = () => {
-      if (box.dataset.state === 'fail') return;
-      box.textContent = '';
-      if (ids.length > 1) box.insertAdjacentHTML('beforeend', `<span class="lbl">画像${k + 1}</span>`);
-      box.appendChild(img);
-      box.dataset.state = 'ok';
-      checkAll();
-    };
-    img.onerror = fail;
     img.onclick = () => {
       const z = document.createElement('div'); z.className = 'zoom';
-      z.innerHTML = `<img src="${d}" alt="拡大画像">`; z.onclick = () => z.remove(); document.body.appendChild(z);
+      const big = img.cloneNode(); big.alt = '拡大画像'; big.onclick = null;
+      z.appendChild(big); z.onclick = () => z.remove(); document.body.appendChild(z);
     };
-    img.src = d;
+    box.textContent = '';
+    if (ids.length > 1) box.insertAdjacentHTML('beforeend', `<span class="lbl">画像${k + 1}</span>`);
+    box.appendChild(img);
   });
+  // 画面に描画されたのを確認してから計測開始
+  const at = idx;
+  requestAnimationFrame(() => requestAnimationFrame(() => { if (idx === at) begin(q); }));
 }
 
 // 質問が見える状態になった時点から時間を計る
 function begin(q) {
   if (begunFor === idx) return;  // 1つの質問で二重に始めない
   begunFor = idx;
-  clearTimeout(imgWait);
   shownAt = performance.now();
   if (!q.timeLimit) return;
   const el = document.getElementById('timer');
