@@ -183,6 +183,8 @@ function renderEditor() {
       <input type="text" id="svTitle" value="${esc(S.title)}">
       <label class="f" for="svDesc">説明文（最初のページに表示）</label>
       <textarea id="svDesc" rows="6">${esc(S.description)}</textarea>
+      <label class="f" for="svThanks">送信後の文章（回答を送信したあとに表示・**文字** で太字）</label>
+      <textarea id="svThanks" rows="4">${esc(S.thanks || '')}</textarea>
       <div class="row" style="margin-top:10px">
         <label class="chk"><input type="checkbox" id="svAcc" ${S.accepting !== false ? 'checked' : ''}>回答を受け付ける</label>
       </div>
@@ -192,6 +194,7 @@ function renderEditor() {
   document.getElementById('copyBtn').onclick = () => { const u = document.getElementById('urlBox'); u.select(); document.execCommand('copy'); };
   document.getElementById('svTitle').oninput = e => { S.title = e.target.value; markDirty(); };
   document.getElementById('svDesc').oninput = e => { S.description = e.target.value; markDirty(); };
+  document.getElementById('svThanks').oninput = e => { S.thanks = e.target.value; markDirty(); };
   document.getElementById('svAcc').onchange = e => { S.accepting = e.target.checked; markDirty(); };
   document.getElementById('addQ').onclick = () => {
     S.questions.push({ id: newId(), title: '', description: '', type: 'single', options: ['選択肢1', '選択肢2'],

@@ -323,7 +323,7 @@ function submit() {
   const payload = { respondentId, startedAt, totalMs: Math.round(performance.now() - t0), answers };
   run('submitResponse', payload).then(() => {
     finished = true;
-    app.innerHTML = `<div class="card"><h1>${esc(S.title)}</h1><p>回答を送信しました。ご協力ありがとうございました。</p></div>`;
+    app.innerHTML = `<div class="card"><h1>${esc(S.title)}</h1><div class="desc">${rich(S.thanks || '回答を送信しました。ご協力ありがとうございました。')}</div></div>`;
   }).catch(e => {
     app.innerHTML = `<div class="card"><p>送信できませんでした：${esc(e.message)}</p>
       <div class="nav"><button class="primary" id="retry">もう一度送信する</button></div></div>`;
